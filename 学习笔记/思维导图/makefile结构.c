@@ -1,0 +1,469 @@
+/* ================================================================
+ * makeint.h — 基础位置类型
+ * ================================================================ */
+
+/* 记录 makefile 中某个元素被读取的位置。
+ * 几乎所有结构体都带一个 floc 字段，用于错误报告和 --debug 输出。
+ * NILF 宏 = ((floc *)0)，表示"无位置信息"。 */
+typedef struct
+  {
+    const char *filenm;       /* 所在文件名（字符串常量，不需 free）         */
+    unsigned long lineno;     /* 行号（1-based）                              */
+    unsigned long offset;     /* 行内字节偏移，用于精确定位                  */
+  } floc;
+
+
+/* ================================================================
+ * hash.h — 通用哈希表
+ * 变量集、文件表都用这个结构，不是特定于变量的。
+ * ================================================================ */
+
+struct hash_table
+{
+  void **ht_vec;              /* 开放寻址槽数组，元素是指针（指向 variable/file 等）
+                               * 空槽 = NULL；已删除槽 = hash_deleted_item 哨兵。
+                               * HASH_VACANT(p) 宏同时检测这两种情况。          */
+
+  hash_func_t ht_hash_1;     /* 一次哈希函数：对 key 算主哈希值
+                               * 变量表用 jhash(name, length)                   */
+  hash_func_t ht_hash_2;     /* 二次哈希函数：用于双重探测（double hashing）
+                               * 变量表的实现里这个是 no-op，jhash 已够散列      */
+  hash_cmp_func_t ht_compare;/* 比较函数：先比 length 再比 name 字节
+                               * 短路掉绝大多数无效 memcmp                       */
+
+  unsigned long ht_size;     /* 槽数组总槽数，必须是 2 的幂（方便取模用位与）   */
+  unsigned long ht_capacity; /* 可用槽数 = ht_size × 装载因子上限（约 0.8）
+                               * 超过此值就 rehash 扩容                          */
+  unsigned long ht_fill;     /* 当前存放的有效元素数                            */
+  unsigned long ht_empty_slots;/* 纯空槽数（不含已删除哨兵槽）
+                               * 查找终止条件：遇到纯空槽说明 key 不存在        */
+  unsigned long ht_collisions;/* 碰撞次数（调试/统计用）                        */
+  unsigned long ht_lookups;  /* 查找调用次数（调试/统计用）                     */
+  unsigned int  ht_rehashes; /* 已扩容次数                                      */
+};
+
+/* 核心操作：
+ *   hash_find_slot(ht, key)  → void**  返回槽的地址（可能为空槽/已删除槽/命中）
+ *   hash_find_item(ht, key)  → void*   直接返回元素指针，没找到返回 NULL
+ *   hash_insert_at(ht, item, slot)      在已定位的槽处插入
+ *   hash_delete_at(ht, slot)            把槽标为 hash_deleted_item 哨兵         */
+
+
+/* ================================================================
+ * variable.h — 变量系统
+ * ================================================================ */
+
+/* ── 来源优先级（数值越大越难被覆盖）──────────────────────────── */
+enum variable_origin
+  {
+    o_default,        /* 内置默认值（如 CC=cc）                                */
+    o_env,            /* 来自进程环境变量                                      */
+    o_file,           /* makefile 中普通赋值                                   */
+    o_env_override,   /* 环境变量 + make -e 标志，比 o_file 优先               */
+    o_command,        /* make 命令行 VAR=val 传入                              */
+    o_override,       /* makefile 中 override 指令                             */
+    o_automatic,      /* 自动变量（$@/$</$^等），define_variable_in_set 里
+                       * 不可被低优先级来源覆盖，因为它是最高值               */
+    o_invalid         /* 哨兵值，出现即触发 abort()                            */
+  };
+/* define_variable_in_set 中的判断：
+ *   if ((int)origin >= (int)v->origin)  → 才允许覆盖已有变量               */
+
+
+/* ── 赋值操作符类型 ───────────────────────────────────────────── */
+enum variable_flavor
+  {
+    f_bogus,          /* 非法值，用于检测未初始化                             */
+    f_simple,         /* := 或 ::=（POSIX）：定义时立即展开 value            */
+    f_recursive,      /* = ：存原始字符串，每次引用时递归展开                */
+    f_append,         /* += ：追加到现有值（中间加空格）                      */
+    f_conditional,    /* ?= ：仅当变量未定义时赋值                            */
+    f_shell,          /* != ：展开后交给 shell 执行，结果作为 f_recursive 存 */
+    f_append_value    /* 内部用：追加但不展开新值（target-specific += 场景）  */
+  };
+
+
+/* ── 一个变量的完整表示 ───────────────────────────────────────── */
+
+/* 两个宏控制 exp_count 位宽，使整个 bitfield 区域恰好填满 32 位 */
+#define EXP_COUNT_BITS  15
+#define EXP_COUNT_MAX   ((1<<EXP_COUNT_BITS)-1)   /* = 32767 */
+
+struct variable
+  {
+    char *name;               /* 变量名（xstrdup 分配，length 字节 + '\0'）
+                               * 每次重命名/undefine 都会 free 旧指针          */
+    char *value;              /* 值字符串（xstrdup 分配）
+                               * f_simple：已展开的最终字符串
+                               * f_recursive：含 $(...) 的原始文本            */
+    floc fileinfo;            /* 定义位置（用于错误输出）                      */
+    unsigned int length;      /* strlen(name)，单独存放以加速哈希比较
+                               * variable_hash_cmp 先比 length 再比字节        */
+
+    /* ── 32 位 bitfield 区（所有 :N 字段紧密打包在一起）──────── */
+    unsigned int recursive:1; /* 1 = 引用时需递归展开（f_recursive/f_append） */
+    unsigned int append:1;    /* 1 = 这是一个 target-specific 的 += 变量      */
+    unsigned int conditional:1;/* 1 = 由 ?= 设定                              */
+    unsigned int per_target:1;/* 1 = target-specific 变量（属于某个 file）     */
+    unsigned int special:1;   /* 1 = 特殊变量（读写时触发钩子，如 .VARIABLES）*/
+    unsigned int exportable:1;/* 1 = 变量名只含 [A-Za-z0-9_]，可以导出到环境 */
+    unsigned int expanding:1; /* 1 = 当前正在被 recursively_expand 展开中
+                               * 防止无限递归：再次进入时若 exp_count==0
+                               * 则 fatal("Recursive variable references itself") */
+    unsigned int private_var:1;/* 1 = 不被子 target 通过 next_is_parent 链继承
+                               * 即 "private" target-specific 变量             */
+    unsigned int exp_count:EXP_COUNT_BITS;
+                              /* 允许有限次自引用展开的计数（最多 32767 次）
+                               * 0 = 禁止自引用；>0 = 每次展开后 --exp_count  */
+
+    /* 两个 enum 字段也打包进 bitfield：ENUM_BITFIELD(N) 取 N 位 */
+    enum variable_flavor
+      flavor ENUM_BITFIELD (3);  /* 赋值操作符类型（3 位能表示 0-7）           */
+    enum variable_origin
+      origin ENUM_BITFIELD (3);  /* 来源优先级（3 位）                          */
+    /*这里的ENUM_BITFIELD(_t)的宏，其实就是：    :_t*/
+    /* export 状态，内嵌 enum 只用 2 位 */
+    enum variable_export
+      {
+        v_export,             /* 显式 export：进入子进程环境                  */
+        v_noexport,           /* 显式 unexport                                */
+        v_ifset,              /* 仅当值非空时导出（内部用）                   */
+        v_default             /* 未指定：由 target_environment() 决定         */
+      } export ENUM_BITFIELD (2);
+  };
+
+
+/* ── 一个变量集合（就是哈希表的封装）────────────────────────── */
+struct variable_set
+  {
+    struct hash_table table;  /* 只有这一个字段。
+                               * table 的元素类型是 struct variable *。
+                               * 初始槽数：全局表 523、per-file 表 23、
+                               * 小作用域（$(call) 等）13                      */
+  };
+
+
+/* ── 作用域链节点 ─────────────────────────────────────────────── */
+struct variable_set_list
+  {
+    struct variable_set_list *next;  /* 指向外层（父）作用域的链节点
+                                      * 链尾是 NULL
+                                      * 全局变量：global_setlist（静态分配）   */
+    struct variable_set *set;        /* 指向本层的变量集合                     */
+    int next_is_parent;              /* 非零：next 指向的是「父 target」的作用域
+                                      * lookup_variable 遇到此标记后，
+                                      * 若找到的变量有 private_var:1 则跳过
+                                      * 用于实现 private target-specific 变量  */
+  };
+/* 全局指针：
+ *   current_variable_set_list  →  当前最内层作用域（链头）
+ *   lookup_variable 沿链遍历，hash_find_item 在每层 table 中查找，
+ *   首次命中立即返回，不再继续往外查                                          */
+
+
+/* ── 模式特定变量（%.o: CC = clang 这类写法）─────────────────── */
+/*static struct pattern_var *pattern_vars = NULL;一个全局链表*/
+struct pattern_var
+  {
+    struct pattern_var *next; /* 全局链表 pattern_vars 的 next 指针
+                               * 链表按 len 升序排列：最短 pattern 在链首
+                               * 但 lookup_pattern_var 从链首向后扫，
+                               * 所以最长 pattern 最后命中→最高优先级         */
+    const char *suffix;       /* target 中 % 之后的子串（不含 %）
+                               * 例："%.o" → suffix 指向 "o"
+                               * 实现：suffix = strchr(target,'%') + 1
+                               * 因此 suffix[-1] == '%' 始终成立               */
+    const char *target;       /* 完整 pattern 字符串，例 "%.o" 或 "lib%.a"    */
+    size_t len;               /* strlen(target)，排序和快速过滤用
+                               * 若 len > targlen 则目标名比 pattern 还短，
+                               * 直接 continue 跳过                            */
+    struct variable variable; /* 内嵌（不是指针）：存放实际的变量定义
+                               * 包括 name/value/flavor/origin 等全部字段      */
+  };
+/* 辅助加速：
+ *   static struct pattern_var *last_pattern_vars[256]
+ *   下标 = len，存放该长度链中最后插入的节点指针
+ *   插入同长度新节点时 O(1) 定位，超过 255 才回退线性扫描                    */
+
+
+/* ================================================================
+ * dep.h — 依赖节点
+ * ================================================================ */
+
+/* ── 名字序列基础宏（被 DEP 宏复用）─────────────────────────── */
+#define NAMESEQ(_t)     \
+    _t *next;           \   /* 链表 next 指针，类型参数化                      */
+    const char *name        /* 字符串名（解析前有值，解析后可能为 NULL）        */
+
+struct nameseq
+  {
+    NAMESEQ (struct nameseq);  /* 展开后：nameseq *next; const char *name;     */
+  };
+/* nameseq 是 glob 展开、文件名解析阶段的通用链表节点
+ * dep 和 goaldep 都通过 DEP 宏以 nameseq 为基础扩展                         */
+
+
+/* ── DEP 宏：依赖节点的所有字段 ──────────────────────────────── */
+#define DEP(_t)                                 \
+    NAMESEQ (_t);                               \   /* next + name            */
+    struct file *file;                          \   /* 解析后指向 struct file  */
+    const char *stem;                           \   /* 静态模式规则的 stem     */
+    unsigned int flags : 8;                     \   /* RM_* 读取标志（goaldep）*/
+    unsigned int changed : 1;                   \   /* 依赖比 target 新        */
+    unsigned int ignore_mtime : 1;              \   /* | 依赖（order-only）    */
+    unsigned int staticpattern : 1;             \   /* 来自静态模式规则        */
+    unsigned int need_2nd_expansion : 1;        \   /* 含未展开 $，需二次展开  */
+    unsigned int ignore_automatic_vars : 1          /* 不影响自动变量计算      */
+
+struct dep
+  {
+    DEP (struct dep);
+    /* 展开后的完整字段：
+     *   struct dep *next;
+     *   const char *name;          字符串名（parse 阶段有值，snap_deps 后清空）
+     *   struct file *file;         snap_deps/enter_prereqs 后填入
+     *   const char *stem;          静态模式规则 "%.o: %.c" 里匹配出的 stem
+     *   unsigned int flags : 8;    RM_* 标志（主要被 goaldep 用）
+     *   unsigned int changed : 1;  mtime 比 target 新，会进入 $? 列表
+     *   unsigned int ignore_mtime : 1;  | 依赖：仅检查存在性，不比较时间戳
+     *   unsigned int staticpattern : 1; 来自 "targets: pattern: prereqs" 语法
+     *   unsigned int need_2nd_expansion : 1; 值里有 $，要在 target 确定后
+     *                                         再展开一次（二次展开）
+     *   unsigned int ignore_automatic_vars : 1; 不参与 $^ $< $? $| 的构建   */
+  };
+
+/* 读取依赖名的宏（两个生命周期阶段都能用）：
+ *   解析前：name 有值，file == NULL
+ *   解析后：name 被清空，file 已填入
+ *   dep_name(d) = (d)->name ? (d)->name : (d)->file->name                   */
+#define dep_name(d)   ((d)->name ? (d)->name : (d)->file->name)
+
+
+/* ── 顶层目标链节点（make 要构建的目标列表）────────────────────── */
+struct goaldep
+  {
+    DEP (struct goaldep);     /* 继承 dep 的全部字段                           */
+    int error;                /* 读取该 makefile 时的错误码（0 = 成功）        */
+    floc floc;                /* 该 goal 在 makefile 中的位置                  */
+    /* flags 字段（来自 DEP 宏的 flags:8）在这里用作 RM_* 标志：
+     *   RM_NO_DEFAULT_GOAL  不设为默认目标
+     *   RM_INCLUDED         从搜索路径中包含的 makefile
+     *   RM_DONTCARE         不存在时不报错（-include）
+     *   RM_NO_TILDE         不展开 ~ 路径                                     */
+  };
+
+
+/* ================================================================
+ * filedef.h — 目标/文件节点（make 数据库的核心）
+ * ================================================================ */
+
+struct file
+  {
+    const char *name;         /* 目标名，来自 strcache（驻留字符串池，不需 free）
+                               * 用 lookup_file/enter_file 通过全局哈希表存取  */
+    const char *hname;        /* 哈希表键名，通常与 name 相同
+                               * 经过 vpath 重写后 hname 保持原始名            */
+    const char *vpath;        /* 若通过 VPATH/vpath 找到实际文件，记录真实路径*/
+
+    struct dep *deps;         /* 所有依赖链表头（含重复，保留 makefile 书写顺序）
+                               * $+ 从这里构建（含重复）
+                               * $^ 去重后的版本（在 set_file_variables 里算）  */
+    struct commands *cmds;    /* 食谱命令块（NULL = 无命令）
+                               * 多条同名单冒号规则共享同一个 cmds              */
+    const char *stem;         /* pattern_search 填入的 % 展开值
+                               * 例：目标 "foo.o" 匹配 "%.o: %.c"，stem="foo"
+                               * 自动变量 $* 直接读取此字段                     */
+
+    struct dep *also_make;    /* 同一条规则同时产生的其他目标
+                               * 例：flex 规则同时产生 .c 和 .h               */
+
+    struct file *prev;        /* 同名双冒号规则的前一条记录（链表）
+                               * foo:: dep1   foo:: dep2  → 两个 file 节点
+                               * 通过 prev/last 串联                           */
+    struct file *last;        /* 同名链表的最后一个节点（tail pointer）
+                               * 用于 O(1) 追加新的双冒号条目                  */
+
+    struct file *renamed;     /* 若此节点被 rename_file 重命名，指向新节点
+                               * check_renamed(f) 宏沿链跟踪到最终名：
+                               *   while ((f)->renamed != 0) (f) = (f)->renamed */
+
+    struct variable_set_list *variables;
+                              /* target-specific 变量作用域链头
+                               * initialize_file_variables 创建并填充：
+                               *   [0] = target 私有 set
+                               *   → [1] = pat_variables（若有 pattern 匹配）
+                               *   → [2] = parent->variables 或 global_setlist  */
+
+    struct variable_set_list *pat_variables;
+                              /* pattern-specific 变量匹配结果集
+                               * initialize_file_variables 扫描 pattern_vars 链，
+                               * 把所有匹配本 target 的 pattern_var 的 variable
+                               * 复制进这个 set，插到 variables 链中间
+                               * pat_searched:1 置位后不再重复搜索              */
+
+    struct file *parent;      /* 触发本 target 被重建的上级 target
+                               * 用于正确构建 $< 等自动变量
+                               * 以及 initialize_file_variables 中的父作用域链  */
+
+    struct file *double_colon;/* 若本节点是双冒号规则的非首条目，
+                               * 指向首条目（即 prev 链的头）
+                               * initialize_file_variables 特殊处理：
+                               * 双冒号条目的变量作用域父节点是首条目           */
+
+    FILE_TIMESTAMP last_mtime;/* 文件修改时间缓存（64位整数编码）
+                               * UNKNOWN_MTIME=0  : 尚未读取
+                               * NONEXISTENT_MTIME=1 : 文件不存在
+                               * NEW_MTIME=INT_MAX : 强制视为最新（.PHONY 用）  */
+    FILE_TIMESTAMP mtime_before_update;
+                              /* 开始构建前记录的旧 mtime
+                               * 构建后对比，判断命令是否真正更新了文件         */
+
+    unsigned int considered;  /* 等于全局 considered 计数器时，说明本次扫描
+                               * 已访问过此节点（防止图中的重复访问）           */
+    int command_flags;        /* 从食谱行 flag 位 OR 进来（COMMANDS_* 宏）      */
+
+    /* 更新状态（2 位 bitfield） */
+    enum update_status
+      {
+        us_success = 0,       /* 已成功更新（必须为 0，方便按位检测）           */
+        us_none,              /* 尚未尝试更新                                   */
+        us_question,          /* make -q 模式：需要更新但不执行                 */
+        us_failed             /* 更新失败                                       */
+      } update_status ENUM_BITFIELD (2);
+
+    /* 命令执行状态（2 位，顺序重要：数值必须递增） */
+    enum cmd_state
+      {
+        cs_not_started = 0,   /* 命令尚未启动（必须为 0）                       */
+        cs_deps_running,      /* 依赖的命令正在运行中（并行 make 用）           */
+        cs_running,           /* 本 target 的命令正在运行                       */
+        cs_finished           /* 命令已执行完毕                                 */
+      } command_state ENUM_BITFIELD (2);
+
+    /* ── 布尔标志位（每个 1 位）──────────────────────────────── */
+    unsigned int builtin:1;       /* 来自内置规则（convert_to_pattern 生成）   */
+    unsigned int precious:1;      /* .PRECIOUS：构建失败时不删除目标文件       */
+    unsigned int loaded:1;        /* 已通过 load 指令动态加载的目标            */
+    unsigned int low_resolution_time:1; /* mtime 精度只有秒级（FAT 文件系统等）*/
+    unsigned int tried_implicit:1;/* 已搜索过隐式规则，不再重复搜索            */
+    unsigned int updating:1;      /* 正在更新本 target 的依赖中（防递归）      */
+    unsigned int updated:1;       /* 已经重建过（避免重复执行）                */
+    unsigned int is_target:1;     /* makefile 中有明确的规则定义了此 target    */
+    unsigned int cmd_target:1;    /* 命令行 make foo 中显式指定的目标          */
+    unsigned int phony:1;         /* .PHONY 的依赖：不检查文件时间戳           */
+    unsigned int intermediate:1;  /* 隐式链中的中间文件
+                                   * 构建完成后 remove_intermediates 会删除它  */
+    unsigned int secondary:1;     /* .SECONDARY：中间文件但不删除              */
+    unsigned int dontcare:1;      /* 找不到或构建失败时不报错（-include 等）   */
+    unsigned int ignore_vpath:1;  /* 已确定不用 VPATH 路径（用本地路径）       */
+    unsigned int pat_searched:1;  /* 已做过 pattern-specific 变量搜索
+                                   * 置 1 后 initialize_file_variables
+                                   * 不再重复扫描 pattern_vars 链              */
+    unsigned int no_diag:1;       /* 失败但不输出诊断信息（配合 dontcare）     */
+  };
+
+
+/* ================================================================
+ * rule.h — 隐式/模式规则
+ * ================================================================ */
+
+struct rule
+  {
+    struct rule *next;        /* 全局链表 pattern_rules 的 next 指针
+                               * pattern_rules → ... → last_pattern_rule → NULL */
+
+    const char **targets;     /* 目标 pattern 字符串数组（num 个元素）
+                               * 例：{"%.o", "%.s"}（一条规则两个目标 pattern）*/
+    unsigned int *lens;       /* 并行数组：lens[i] = strlen(targets[i])
+                               * pattern_search 里用于快速排除：
+                               *   if (rule->lens[ti] > namelen) continue;      */
+    const char **suffixes;    /* 并行数组：suffixes[i] 指向 targets[i] 中
+                               * % 之后的子串（不含 % 本身）
+                               * 例：targets[0]="%.o" → suffixes[0]="o"
+                               * 用于 stem 计算和后缀匹配                       */
+
+    struct dep *deps;         /* 依赖 pattern 链表
+                               * pattern_search 匹配成功后展开 % 为实际 stem    */
+    struct commands *cmds;    /* 食谱（NULL = 该规则无命令，即取消同名内置规则）*/
+    unsigned short num;       /* targets 数组的元素数                           */
+    char terminal;            /* 1 = 双冒号隐式规则（terminal rule）
+                               * pattern_search recursions>0 时跳过非 terminal，
+                               * 防止把它用作中间文件                           */
+    char in_use;              /* 1 = 当前被某个 pattern_search 调用栈占用
+                               * 防止同一条规则递归触发自身（隐式规则环路）     */
+  };
+
+/* 全局变量（rule.c）：
+ *   pattern_rules      → 链表头
+ *   last_pattern_rule  → 链表尾（O(1) 追加）
+ *   num_pattern_rules  → 规则总数
+ *   suffix_file        → .SUFFIXES 伪目标的 struct file *（旧式后缀规则用）   */
+
+
+/* ================================================================
+ * implicit.c（非头文件，但结构体同样重要）
+ * ================================================================ */
+
+/* ── pattern_search 展开后依赖的临时记录 ─────────────────────── */
+struct patdeps
+  {
+    const char *name;         /* 展开 % 后的实际依赖路径                       */
+    const char *pattern;      /* 原始 dep pattern（含 %）
+                               * 仅对中间文件有意义：作为该中间 file 的
+                               * implicit rule pattern，用于设置其 stem         */
+    struct file *file;        /* 展开后对应的 struct file *（中间文件时有值）   */
+    unsigned int ignore_mtime : 1;          /* 从 dep 复制过来                 */
+    unsigned int ignore_automatic_vars : 1; /* 从 dep 复制过来                 */
+  };
+
+
+/* ── 模式规则候选项（pattern_search 内部数组元素）─────────────── */
+struct tryrule
+  {
+    struct rule *rule;        /* 指向候选的 struct rule                         */
+    size_t stemlen;           /* 本次匹配算出的 stem 长度
+                               * qsort 主键：stemlen 最小的优先尝试
+                               * （最短 stem = 最长 prefix+suffix = 最具体匹配）*/
+    unsigned int matches;     /* rule->targets 数组中命中的下标
+                               * 一条规则多目标时，记录哪个 target 匹配上了     */
+    unsigned int order;       /* 该规则在 tryrules[] 中的原始位置
+                               * 用于稳定排序：stemlen 相同时按定义先后顺序     */
+    char checked_lastslash;   /* 1 = 目标名含目录前缀，且该前缀已从 stem 中去除
+                               * stem 只含纯文件名部分，pathlen 已加回 stemlen   */
+  };
+/* stem 计算公式（implicit.c:333，pattern_search 内）：
+ *   stem    = filename + (suffix - target - 1)
+ *   stemlen = namelen  - rule->lens[ti] + 1
+ * 匹配条件：
+ *   ① strneq(target, filename, stem - filename)   → 前缀匹配
+ *   ② suffix[0] == stem[stemlen]
+ *      && (*suffix=='\0' || streq(&suffix[1], &stem[stemlen+1]))  → 后缀匹配  */
+
+
+/* ================================================================
+ * commands.h — 食谱命令块
+ * ================================================================ */
+
+struct commands
+  {
+    floc fileinfo;            /* 食谱在 makefile 中的定义位置
+                               * 用于错误报告：make: [Makefile:42: foo.o] Error 1 */
+    char *commands;           /* 食谱原始文本（所有行拼在一起，\n 分隔）
+                               * chop_commands 把它切割成下面的 command_lines  */
+    char **command_lines;     /* 切割后每行的字符串数组（ncommand_lines 个元素）
+                               * 执行时逐行展开变量并交给 shell                 */
+    unsigned char *lines_flags; /* 并行数组：每个元素对应一行的标志位
+                               *   COMMANDS_RECURSE = 1   行有 + 或 $(MAKE)
+                               *   COMMANDS_SILENT  = 2   行有 @，不打印命令
+                               *   COMMANDS_NOERROR = 4   行有 -，失败不终止    */
+    unsigned short ncommand_lines; /* command_lines 数组的元素数               */
+    char recipe_prefix;       /* 食谱行前缀字符，默认 '\t'
+                               * 可被 .RECIPEPREFIX 特殊变量修改               */
+    unsigned int any_recurse:1; /* 1 = 至少一行的 lines_flags 有 COMMANDS_RECURSE
+                                 * 用于决定是否需要传递 MAKEFLAGS 等给子 make   */
+  };
+
+/* lines_flags 位掩码 */
+#define COMMANDS_RECURSE  1   /* + 前缀或含 $(MAKE)：递归调用子 make          */
+#define COMMANDS_SILENT   2   /* @ 前缀：执行但不回显命令行                   */
+#define COMMANDS_NOERROR  4   /* - 前缀：命令失败时继续执行，不中断           */
