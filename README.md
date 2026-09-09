@@ -1,1 +1,1 @@
-我的学习笔记，面向linux与内核驱动。当前进度：uboot移植于uboot源码分析
+我的学习笔记，面向linux内核与驱动。当前进度：uboot移植于uboot源码分析
